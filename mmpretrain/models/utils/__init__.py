@@ -31,7 +31,10 @@ from .sparse_modules import (SparseAvgPooling, SparseBatchNorm2d, SparseConv2d,
 from .swiglu_ffn import SwiGLUFFN, SwiGLUFFNFused
 from .vector_quantizer import NormEMAVectorQuantizer
 
+from .rnn import DWSConvLSTM2d
+
 __all__ = [
+    'DWSConvLSTM2d',
     'channel_shuffle',
     'make_divisible',
     'InvertedResidual',

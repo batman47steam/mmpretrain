@@ -17,6 +17,9 @@ from ..utils import (ShiftWindowMSA, resize_pos_embed,
                      resize_relative_position_bias_table, to_2tuple)
 from .base_backbone import BaseBackbone
 
+from einops import rearrange
+from ..utils import DWSConvLSTM2d
+
 
 class SwinBlock(BaseModule):
     """Swin Transformer block.
@@ -275,7 +278,7 @@ class SwinTransformer(BaseBackbone):
     arch_zoo = {
         **dict.fromkeys(['t', 'tiny'],
                         {'embed_dims': 96,
-                         'depths':     [2, 2,  6,  2],
+                         'depths':     [2, 2,  2,  2], # [2,2,6,2]
                          'num_heads':  [3, 6, 12, 24]}),
         **dict.fromkeys(['s', 'small'],
                         {'embed_dims': 96,
@@ -336,6 +339,8 @@ class SwinTransformer(BaseBackbone):
         self.use_abs_pos_embed = use_abs_pos_embed
         self.interpolate_mode = interpolate_mode
         self.frozen_stages = frozen_stages
+
+
 
         _patch_cfg = dict(
             in_channels=in_channels,
@@ -410,6 +415,17 @@ class SwinTransformer(BaseBackbone):
 
             self.add_module(f'norm{i}', norm_layer)
 
+        self.rnn_layers_current = []
+        # self.rnn_layers_current.append(DWSConvLSTM2d(64)) # 对应每层的通道数
+        self.rnn_layers_1 = DWSConvLSTM2d(self.num_features[0], dws_conv=False)
+        self.rnn_layers_2 = DWSConvLSTM2d(self.num_features[1], dws_conv=False)
+        self.rnn_layers_3 = DWSConvLSTM2d(self.num_features[2], dws_conv=False)
+        self.rnn_layers_4 = DWSConvLSTM2d(self.num_features[3], dws_conv=False)
+        self.rnn_layers_current.append(self.rnn_layers_1)
+        self.rnn_layers_current.append(self.rnn_layers_2)
+        self.rnn_layers_current.append(self.rnn_layers_3)
+        self.rnn_layers_current.append(self.rnn_layers_4)
+
     def init_weights(self):
         super(SwinTransformer, self).init_weights()
 
@@ -422,6 +438,9 @@ class SwinTransformer(BaseBackbone):
             trunc_normal_(self.absolute_pos_embed, std=0.02)
 
     def forward(self, x):
+        B, C, H, W = x.shape
+        T = 256
+        B = B//256
         x, hw_shape = self.patch_embed(x)
         if self.use_abs_pos_embed:
             x = x + resize_pos_embed(
@@ -431,17 +450,28 @@ class SwinTransformer(BaseBackbone):
 
         outs = []
         for i, stage in enumerate(self.stages):
-            x, hw_shape = stage(
+            x, hw_shape = stage(  # hw_shape 就是一个元组，表示当前特征图的shape, x的shape （B, hw, c)
                 x, hw_shape, do_downsample=self.out_after_downsample)
-            if i in self.out_indices:
+            #h = hw_shape[0]
+            #h,w = *hw_shape
+            x = rearrange(x, '(b t) (h w) c -> t b c h w', b=B, h=hw_shape[0])
+            Hx = torch.zeros(x.shape, device=x.device)
+            for t in range(T):
+                if t == 0:
+                    h_t, c_t = self.rnn_layers_current[i](x[t])
+                else:
+                    h_t, c_t = self.rnn_layers_current[i](x[t], (h_t, c_t))
+                Hx[t,:] = h_t
+            x = rearrange(Hx, 't b c h w -> (b t) (h w) c', b=B, h=hw_shape[0])
+            if i in self.out_indices:  # out_indices=3, stage 最后的768的LayerNorm就是从这里来的
                 norm_layer = getattr(self, f'norm{i}')
                 out = norm_layer(x)
                 out = out.view(-1, *hw_shape,
                                self.num_features[i]).permute(0, 3, 1,
                                                              2).contiguous()
-                outs.append(out)
+                outs.append(out) # out是通过这个又reshape成了B,C,H,W的形式 （512， 768， 4， 4）
             if stage.downsample is not None and not self.out_after_downsample:
-                x, hw_shape = stage.downsample(x, hw_shape)
+                x, hw_shape = stage.downsample(x, hw_shape) # (8, 3136, 96) = > (8, 784, 192) 28 x 28， 通道数翻了一倍
 
         return tuple(outs)
 
