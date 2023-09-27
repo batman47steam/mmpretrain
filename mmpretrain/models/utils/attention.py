@@ -565,7 +565,7 @@ class MultiheadAttention(BaseModule):
         else:
             self.scaled_dot_product_attention = scaled_dot_product_attention
 
-        self.qkv = nn.Linear(self.input_dims, embed_dims * 3, bias=qkv_bias)
+        self.qkv = nn.Linear(self.input_dims, embed_dims * 3, bias=qkv_bias) # qkv 就是很简单的线性映射，dims映射为原本的3倍
         self.attn_drop = attn_drop
         self.proj = nn.Linear(embed_dims, embed_dims, bias=proj_bias)
         self.proj_drop = nn.Dropout(proj_drop)
@@ -584,20 +584,20 @@ class MultiheadAttention(BaseModule):
         else:
             self.gamma1 = nn.Identity()
 
-    def forward(self, x):
+    def forward(self, x):  # x (4, 197, 768)
         B, N, _ = x.shape
-        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads,
-                                  self.head_dims).permute(2, 0, 3, 1, 4)
-        q, k, v = qkv[0], qkv[1], qkv[2]
+        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads,  # num_heads乘上head_dims应该就是原本的特征维度，3是对应qkv吧
+                                  self.head_dims).permute(2, 0, 3, 1, 4) # qkv (3, 4, 12, 197, 64) 12个head的attention，64 x 12 = 768
+        q, k, v = qkv[0], qkv[1], qkv[2] # （b, heads, N, feature)
 
         attn_drop = self.attn_drop if self.training else 0.
-        x = self.scaled_dot_product_attention(q, k, v, dropout_p=attn_drop)
-        x = x.transpose(1, 2).reshape(B, N, self.embed_dims)
+        x = self.scaled_dot_product_attention(q, k, v, dropout_p=attn_drop) # q乘上k得到一个权重，最后这个权重作用在v上，shape 肯定是和v的shape一样
+        x = x.transpose(1, 2).reshape(B, N, self.embed_dims) # 相当于把所有head提取的特征又合起来了
 
-        x = self.proj(x)
+        x = self.proj(x) # 全连接层，但是维度不变，相当于这些特征又融合了一下
         x = self.out_drop(self.gamma1(self.proj_drop(x)))
 
-        if self.v_shortcut:
+        if self.v_shortcut: # 跳跃连接，但是加上的是value，还不是直接的x
             x = v.squeeze(1) + x
         return x
 

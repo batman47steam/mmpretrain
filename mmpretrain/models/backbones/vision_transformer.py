@@ -104,8 +104,8 @@ class TransformerEncoderLayer(BaseModule):
                 nn.init.normal_(m.bias, std=1e-6)
 
     def forward(self, x):
-        x = x + self.attn(self.ln1(x))
-        x = self.ffn(self.ln2(x), identity=x)
+        x = x + self.attn(self.ln1(x))  # multihead attention
+        x = self.ffn(self.ln2(x), identity=x) # 带dropout的全连接层，激活函数是GELU
         return x
 
 
@@ -295,7 +295,7 @@ class VisionTransformer(BaseBackbone):
         )
         _patch_cfg.update(patch_cfg)
         self.patch_embed = PatchEmbed(**_patch_cfg)
-        self.patch_resolution = self.patch_embed.init_out_size
+        self.patch_resolution = self.patch_embed.init_out_size # 224 / 16 = 14
         num_patches = self.patch_resolution[0] * self.patch_resolution[1]
 
         # Set out type
@@ -306,7 +306,7 @@ class VisionTransformer(BaseBackbone):
 
         # Set cls token
         self.with_cls_token = with_cls_token
-        if with_cls_token:
+        if with_cls_token:  # 额外的添加一个用于分类的token，token的维度就和img patch 经过projection以后的维度一样
             self.cls_token = nn.Parameter(torch.zeros(1, 1, self.embed_dims))
         elif out_type != 'cls_token':
             self.cls_token = None
@@ -317,12 +317,12 @@ class VisionTransformer(BaseBackbone):
 
         # Set position embedding
         self.interpolate_mode = interpolate_mode
-        self.pos_embed = nn.Parameter(
-            torch.zeros(1, num_patches + self.num_extra_tokens,
+        self.pos_embed = nn.Parameter(  # nn.parameter就是表示可以学习的
+            torch.zeros(1, num_patches + self.num_extra_tokens, # token的数目就是image patch的数目，额外加上一个用于分类的token
                         self.embed_dims))
         self._register_load_state_dict_pre_hook(self._prepare_pos_embed)
 
-        self.drop_after_pos = nn.Dropout(p=drop_rate)
+        self.drop_after_pos = nn.Dropout(p=drop_rate) # 还有个dropout吗，是用在哪里的
 
         if isinstance(out_indices, int):
             out_indices = [out_indices]
@@ -334,7 +334,7 @@ class VisionTransformer(BaseBackbone):
                 out_indices[i] = self.num_layers + index
             assert 0 <= out_indices[i] <= self.num_layers, \
                 f'Invalid out_indices {index}'
-        self.out_indices = out_indices
+        self.out_indices = out_indices # transformer堆叠了12个layer，这个应该是和那个对应的
 
         # stochastic depth decay rule
         dpr = np.linspace(0, drop_path_rate, self.num_layers)
@@ -342,7 +342,7 @@ class VisionTransformer(BaseBackbone):
         self.layers = ModuleList()
         if isinstance(layer_cfgs, dict):
             layer_cfgs = [layer_cfgs] * self.num_layers
-        for i in range(self.num_layers):
+        for i in range(self.num_layers): # 这里就是堆叠的transformer layer
             _layer_cfg = dict(
                 embed_dims=self.embed_dims,
                 num_heads=self.arch_settings['num_heads'],
@@ -458,22 +458,22 @@ class VisionTransformer(BaseBackbone):
 
     def forward(self, x):
         B = x.shape[0]
-        x, patch_resolution = self.patch_embed(x)
+        x, patch_resolution = self.patch_embed(x)  # x => (4, 196, 768) 4是batch，196表示有patch数量，768是每个batch的特征维度
 
         if self.cls_token is not None:
             # stole cls_tokens impl from Phil Wang, thanks
             cls_token = self.cls_token.expand(B, -1, -1)
-            x = torch.cat((cls_token, x), dim=1)
+            x = torch.cat((cls_token, x), dim=1) # x => (4, 197, 768) 额外加上了分类的token
 
-        x = x + resize_pos_embed(
+        x = x + resize_pos_embed( # 位置编码应该是直接就在x上面的
             self.pos_embed,
             self.patch_resolution,
             patch_resolution,
             mode=self.interpolate_mode,
             num_extra_tokens=self.num_extra_tokens)
-        x = self.drop_after_pos(x)
+        x = self.drop_after_pos(x) # 就是针对那种全连接层的drop吧
 
-        x = self.pre_norm(x)
+        x = self.pre_norm(x) # pre_norm是identity()基本上什么都不用做吧
 
         outs = []
         for i, layer in enumerate(self.layers):
@@ -482,12 +482,12 @@ class VisionTransformer(BaseBackbone):
             if i == len(self.layers) - 1 and self.final_norm:
                 x = self.ln1(x)
 
-            if i in self.out_indices:
+            if i in self.out_indices: # 调整实际输出的格式
                 outs.append(self._format_output(x, patch_resolution))
 
         return tuple(outs)
 
-    def _format_output(self, x, hw):
+    def _format_output(self, x, hw): # 用来决定输出的形式到底是什么
         if self.out_type == 'raw':
             return x
         if self.out_type == 'cls_token':
