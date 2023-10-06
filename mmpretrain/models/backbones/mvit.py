@@ -16,6 +16,8 @@ from ..builder import BACKBONES
 from ..utils import resize_pos_embed
 from .base_backbone import BaseBackbone
 
+from einops import rearrange
+from ..utils import DWSConvLSTM2d
 
 def resize_decomposed_rel_pos(rel_pos, q_size, k_size):
     """Get relative positional embeddings according to the relative positions
@@ -591,6 +593,17 @@ class MViT(BaseBackbone):
                 f'Invalid out_scales {index}'
         self.out_scales = sorted(list(out_scales))
 
+        self.rnn_layers_current = []
+        # self.rnn_layers_current.append(DWSConvLSTM2d(64)) # 对应每层的通道数
+        self.rnn_layers_1 = DWSConvLSTM2d(96, dws_conv=False)
+        self.rnn_layers_2 = DWSConvLSTM2d(192, dws_conv=False)
+        self.rnn_layers_3 = DWSConvLSTM2d(384, dws_conv=False)
+        self.rnn_layers_4 = DWSConvLSTM2d(768, dws_conv=False)
+        self.rnn_layers_current.append(self.rnn_layers_1)
+        self.rnn_layers_current.append(self.rnn_layers_2)
+        self.rnn_layers_current.append(self.rnn_layers_3)
+        self.rnn_layers_current.append(self.rnn_layers_4)
+
         # Set patch embedding
         _patch_cfg = dict(
             in_channels=in_channels,
@@ -674,7 +687,10 @@ class MViT(BaseBackbone):
 
     def forward(self, x):
         """Forward the MViT."""
-        B = x.shape[0]
+        B, C, H, W = x.shape
+        T = 256
+        B = B // 256
+        #B = x.shape[0]
         x, patch_resolution = self.patch_embed(x) # x (B, HW, C) 四倍降采样
 
         if self.use_abs_pos_embed:
@@ -691,6 +707,15 @@ class MViT(BaseBackbone):
 
             if i in self.stage_indices:  # dict{0: 0, 2: 1, 7:2, 9:3} 总共有10个block，按照这个index划分为4个stage
                 stage_index = self.stage_indices[i] # 第 0,2,7,9个block分别对应着4个stage
+                x = rearrange(x, '(b t) (h w) c -> t b c h w', b=B, h=patch_resolution[0])
+                Hx = torch.zeros(x.shape, device=x.device)
+                for t in range(T):
+                    if t == 0:
+                        h_t, c_t = self.rnn_layers_current[stage_index](x[t])
+                    else:
+                        h_t, c_t = self.rnn_layers_current[stage_index](x[t], (h_t, c_t))
+                    Hx[t, :] = h_t
+                x = rearrange(Hx, 't b c h w -> (b t) (h w) c', b=B, h=patch_resolution[0])
                 if stage_index in self.out_scales:  # out_scales是3, 只有满足out_scales的才会输出
                     B, _, C = x.shape
                     x = getattr(self, f'norm{stage_index}')(x)
