@@ -675,7 +675,7 @@ class MViT(BaseBackbone):
     def forward(self, x):
         """Forward the MViT."""
         B = x.shape[0]
-        x, patch_resolution = self.patch_embed(x)
+        x, patch_resolution = self.patch_embed(x) # x (B, HW, C) 四倍降采样
 
         if self.use_abs_pos_embed:
             x = x + resize_pos_embed(
@@ -689,9 +689,9 @@ class MViT(BaseBackbone):
         for i, block in enumerate(self.blocks):
             x, patch_resolution = block(x, patch_resolution)
 
-            if i in self.stage_indices:
-                stage_index = self.stage_indices[i]
-                if stage_index in self.out_scales:
+            if i in self.stage_indices:  # dict{0: 0, 2: 1, 7:2, 9:3} 总共有10个block，按照这个index划分为4个stage
+                stage_index = self.stage_indices[i] # 第 0,2,7,9个block分别对应着4个stage
+                if stage_index in self.out_scales:  # out_scales是3, 只有满足out_scales的才会输出
                     B, _, C = x.shape
                     x = getattr(self, f'norm{stage_index}')(x)
                     out = x.transpose(1, 2).reshape(B, C, *patch_resolution)
