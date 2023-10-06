@@ -13,6 +13,8 @@ from mmpretrain.registry import MODELS
 from ..utils import GRN, build_norm_layer
 from .base_backbone import BaseBackbone
 
+from ..utils import DWSConvLSTM2d
+from einops import rearrange
 
 class ConvNeXtBlock(BaseModule):
     """ConvNeXt Block.
@@ -296,11 +298,22 @@ class ConvNeXt(BaseBackbone):
                 stride=stem_patch_size),
             build_norm_layer(norm_cfg, self.channels[0]),
         )
-        self.downsample_layers.append(stem)
+        self.downsample_layers.append(stem) # 第一层的是stem
 
         # 4 feature resolution stages, each consisting of multiple residual
         # blocks
         self.stages = nn.ModuleList()
+
+        self.rnn_layers_current = []
+        # self.rnn_layers_current.append(DWSConvLSTM2d(64)) # 对应每层的通道数
+        self.rnn_layers_1 = DWSConvLSTM2d(self.channels[0], dws_conv=False)
+        self.rnn_layers_2 = DWSConvLSTM2d(self.channels[1], dws_conv=False)
+        self.rnn_layers_3 = DWSConvLSTM2d(self.channels[2], dws_conv=False)
+        self.rnn_layers_4 = DWSConvLSTM2d(self.channels[3], dws_conv=False)
+        self.rnn_layers_current.append(self.rnn_layers_1)
+        self.rnn_layers_current.append(self.rnn_layers_2)
+        self.rnn_layers_current.append(self.rnn_layers_3)
+        self.rnn_layers_current.append(self.rnn_layers_4)
 
         for i in range(self.num_stages):
             depth = self.depths[i]
@@ -315,7 +328,7 @@ class ConvNeXt(BaseBackbone):
                         kernel_size=2,
                         stride=2),
                 )
-                self.downsample_layers.append(downsample_layer)
+                self.downsample_layers.append(downsample_layer) # layernorm + 不重叠的2x2的卷积
 
             stage = Sequential(*[
                 ConvNeXtBlock(
@@ -339,10 +352,28 @@ class ConvNeXt(BaseBackbone):
         self._freeze_stages()
 
     def forward(self, x):
+        B, C, H, W = x.shape
+        T = 256
+        B = B//256
+
         outs = []
         for i, stage in enumerate(self.stages):
-            x = self.downsample_layers[i](x)
+            x = self.downsample_layers[i](x) # downsample里面的第一层是4x4的patch，后面都是正常的layernorm加上卷积
             x = stage(x)
+
+            # 还原t的维度
+            x = rearrange(x, '(b t) c h w -> t b c h w', b=B)
+            # 隐状态
+            Hx = torch.zeros(x.shape, device=x.device)
+            # 调用cell，传递隐状态
+            for t in range(T):
+                if t == 0:
+                    h_t, c_t = self.rnn_layers_current[i](x[t])
+                else:
+                    h_t, c_t = self.rnn_layers_current[i](x[t], (h_t, c_t))
+                Hx[t, :] = h_t
+            x = rearrange(Hx, 't b c h w -> (b t) c h w')
+
             if i in self.out_indices:
                 norm_layer = getattr(self, f'norm{i}')
                 if self.gap_before_final_norm:
