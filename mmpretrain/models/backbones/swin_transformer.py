@@ -20,6 +20,407 @@ from .base_backbone import BaseBackbone
 from einops import rearrange
 from ..utils import DWSConvLSTM2d
 
+from torchvision import models as tvmodels
+from mmcv.cnn.bricks import DropPath
+from mmcv.cnn import (ConvModule, build_activation_layer, build_conv_layer,
+                      build_norm_layer)
+
+eps = 1.0e-5
+
+
+class BasicBlock(BaseModule):
+    """BasicBlock for ResNet.
+
+    Args:
+        in_channels (int): Input channels of this block.
+        out_channels (int): Output channels of this block.
+        expansion (int): The ratio of ``out_channels/mid_channels`` where
+            ``mid_channels`` is the output channels of conv1. This is a
+            reserved argument in BasicBlock and should always be 1. Default: 1.
+        stride (int): stride of the block. Default: 1
+        dilation (int): dilation of convolution. Default: 1
+        downsample (nn.Module, optional): downsample operation on identity
+            branch. Default: None.
+        style (str): `pytorch` or `caffe`. It is unused and reserved for
+            unified API with Bottleneck.
+        with_cp (bool): Use checkpoint or not. Using checkpoint will save some
+            memory while slowing down the training speed.
+        conv_cfg (dict, optional): dictionary to construct and config conv
+            layer. Default: None
+        norm_cfg (dict): dictionary to construct and config norm layer.
+            Default: dict(type='BN')
+    """
+
+    def __init__(self,
+                 in_channels,
+                 out_channels,
+                 expansion=1,
+                 stride=1,
+                 dilation=1,
+                 downsample=None,
+                 style='pytorch',
+                 with_cp=False,
+                 conv_cfg=None,
+                 norm_cfg=dict(type='BN'),
+                 drop_path_rate=0.0,
+                 act_cfg=dict(type='ReLU', inplace=True),
+                 init_cfg=None):
+        super(BasicBlock, self).__init__(init_cfg=init_cfg)
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.expansion = expansion
+        assert self.expansion == 1
+        assert out_channels % expansion == 0
+        self.mid_channels = out_channels // expansion
+        self.stride = stride
+        self.dilation = dilation
+        self.style = style
+        self.with_cp = with_cp
+        self.conv_cfg = conv_cfg
+        self.norm_cfg = norm_cfg
+
+        self.norm1_name, norm1 = build_norm_layer(
+            norm_cfg, self.mid_channels, postfix=1)
+        self.norm2_name, norm2 = build_norm_layer(
+            norm_cfg, out_channels, postfix=2)
+
+        self.conv1 = build_conv_layer(
+            conv_cfg,
+            in_channels,
+            self.mid_channels,
+            3,
+            stride=stride,
+            padding=dilation,
+            dilation=dilation,
+            bias=False)
+        self.add_module(self.norm1_name, norm1)
+        self.conv2 = build_conv_layer(
+            conv_cfg,
+            self.mid_channels,
+            out_channels,
+            3,
+            padding=1,
+            bias=False)
+        self.add_module(self.norm2_name, norm2)
+
+        self.relu = build_activation_layer(act_cfg)
+        self.downsample = downsample
+        self.drop_path = DropPath(drop_prob=drop_path_rate
+                                  ) if drop_path_rate > eps else nn.Identity()
+
+    @property
+    def norm1(self):
+        return getattr(self, self.norm1_name)
+
+    @property
+    def norm2(self):
+        return getattr(self, self.norm2_name)
+
+    def forward(self, x):
+
+        def _inner_forward(x):
+            identity = x
+
+            out = self.conv1(x)
+            out = self.norm1(out)
+            out = self.relu(out)
+
+            out = self.conv2(out)
+            out = self.norm2(out)
+
+            if self.downsample is not None:
+                identity = self.downsample(x)
+
+            out = self.drop_path(out)
+
+            out += identity
+
+            return out
+
+        if self.with_cp and x.requires_grad:
+            out = cp.checkpoint(_inner_forward, x)
+        else:
+            out = _inner_forward(x)
+
+        out = self.relu(out)
+
+        return out
+
+
+class Bottleneck(BaseModule):
+    """Bottleneck block for ResNet.
+
+    Args:
+        in_channels (int): Input channels of this block.
+        out_channels (int): Output channels of this block.
+        expansion (int): The ratio of ``out_channels/mid_channels`` where
+            ``mid_channels`` is the input/output channels of conv2. Default: 4.
+        stride (int): stride of the block. Default: 1
+        dilation (int): dilation of convolution. Default: 1
+        downsample (nn.Module, optional): downsample operation on identity
+            branch. Default: None.
+        style (str): ``"pytorch"`` or ``"caffe"``. If set to "pytorch", the
+            stride-two layer is the 3x3 conv layer, otherwise the stride-two
+            layer is the first 1x1 conv layer. Default: "pytorch".
+        with_cp (bool): Use checkpoint or not. Using checkpoint will save some
+            memory while slowing down the training speed.
+        conv_cfg (dict, optional): dictionary to construct and config conv
+            layer. Default: None
+        norm_cfg (dict): dictionary to construct and config norm layer.
+            Default: dict(type='BN')
+    """
+
+    def __init__(self,
+                 in_channels,
+                 out_channels,
+                 expansion=4,
+                 stride=1,
+                 dilation=1,
+                 downsample=None,
+                 style='pytorch',
+                 with_cp=False,
+                 conv_cfg=None,
+                 norm_cfg=dict(type='BN'),
+                 act_cfg=dict(type='ReLU', inplace=True),
+                 drop_path_rate=0.0,
+                 init_cfg=None):
+        super(Bottleneck, self).__init__(init_cfg=init_cfg)
+        assert style in ['pytorch', 'caffe']
+
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.expansion = expansion
+        assert out_channels % expansion == 0
+        self.mid_channels = out_channels // expansion
+        self.stride = stride
+        self.dilation = dilation
+        self.style = style
+        self.with_cp = with_cp
+        self.conv_cfg = conv_cfg
+        self.norm_cfg = norm_cfg
+
+        if self.style == 'pytorch':
+            self.conv1_stride = 1
+            self.conv2_stride = stride
+        else:
+            self.conv1_stride = stride
+            self.conv2_stride = 1
+
+        self.norm1_name, norm1 = build_norm_layer(
+            norm_cfg, self.mid_channels, postfix=1)
+        self.norm2_name, norm2 = build_norm_layer(
+            norm_cfg, self.mid_channels, postfix=2)
+        self.norm3_name, norm3 = build_norm_layer(
+            norm_cfg, out_channels, postfix=3)
+
+        self.conv1 = build_conv_layer(
+            conv_cfg,
+            in_channels,
+            self.mid_channels,
+            kernel_size=1,
+            stride=self.conv1_stride,
+            bias=False)
+        self.add_module(self.norm1_name, norm1)
+        self.conv2 = build_conv_layer(
+            conv_cfg,
+            self.mid_channels,
+            self.mid_channels,
+            kernel_size=3,
+            stride=self.conv2_stride,
+            padding=dilation,
+            dilation=dilation,
+            bias=False)
+
+        self.add_module(self.norm2_name, norm2)
+        self.conv3 = build_conv_layer(
+            conv_cfg,
+            self.mid_channels,
+            out_channels,
+            kernel_size=1,
+            bias=False)
+        self.add_module(self.norm3_name, norm3)
+
+        self.relu = build_activation_layer(act_cfg)
+        self.downsample = downsample
+        self.drop_path = DropPath(drop_prob=drop_path_rate
+                                  ) if drop_path_rate > eps else nn.Identity()
+
+    @property
+    def norm1(self):
+        return getattr(self, self.norm1_name)
+
+    @property
+    def norm2(self):
+        return getattr(self, self.norm2_name)
+
+    @property
+    def norm3(self):
+        return getattr(self, self.norm3_name)
+
+    def forward(self, x):
+
+        def _inner_forward(x):
+            identity = x
+
+            out = self.conv1(x)
+            out = self.norm1(out)
+            out = self.relu(out)
+
+            out = self.conv2(out)
+            out = self.norm2(out)
+            out = self.relu(out)
+
+            out = self.conv3(out)
+            out = self.norm3(out)
+
+            if self.downsample is not None:
+                identity = self.downsample(x)
+
+            out = self.drop_path(out)
+
+            out += identity
+
+            return out
+
+        if self.with_cp and x.requires_grad:
+            out = cp.checkpoint(_inner_forward, x)
+        else:
+            out = _inner_forward(x)
+
+        out = self.relu(out)
+
+        return out
+
+
+def get_expansion(block, expansion=None):
+    """Get the expansion of a residual block.
+
+    The block expansion will be obtained by the following order:
+
+    1. If ``expansion`` is given, just return it.
+    2. If ``block`` has the attribute ``expansion``, then return
+       ``block.expansion``.
+    3. Return the default value according the the block type:
+       1 for ``BasicBlock`` and 4 for ``Bottleneck``.
+
+    Args:
+        block (class): The block class.
+        expansion (int | None): The given expansion ratio.
+
+    Returns:
+        int: The expansion of the block.
+    """
+    if isinstance(expansion, int):
+        assert expansion > 0
+    elif expansion is None:
+        if hasattr(block, 'expansion'):
+            expansion = block.expansion
+        elif issubclass(block, BasicBlock):
+            expansion = 1
+        elif issubclass(block, Bottleneck):
+            expansion = 4
+        else:
+            raise TypeError(f'expansion is not specified for {block.__name__}')
+    else:
+        raise TypeError('expansion must be an integer or None')
+
+    return expansion
+
+
+class ResLayer(nn.Sequential):
+    """ResLayer to build ResNet style backbone.
+
+    Args:
+        block (nn.Module): Residual block used to build ResLayer.
+        num_blocks (int): Number of blocks.
+        in_channels (int): Input channels of this block.
+        out_channels (int): Output channels of this block.
+        expansion (int, optional): The expansion for BasicBlock/Bottleneck.
+            If not specified, it will firstly be obtained via
+            ``block.expansion``. If the block has no attribute "expansion",
+            the following default values will be used: 1 for BasicBlock and
+            4 for Bottleneck. Default: None.
+        stride (int): stride of the first block. Default: 1.
+        avg_down (bool): Use AvgPool instead of stride conv when
+            downsampling in the bottleneck. Default: False
+        conv_cfg (dict, optional): dictionary to construct and config conv
+            layer. Default: None
+        norm_cfg (dict): dictionary to construct and config norm layer.
+            Default: dict(type='BN')
+        drop_path_rate (float or list): stochastic depth rate.
+            Default: 0.
+    """
+
+    def __init__(self,
+                 block,
+                 num_blocks,
+                 in_channels,
+                 out_channels,
+                 expansion=None,
+                 stride=1,
+                 avg_down=False,
+                 conv_cfg=None,
+                 norm_cfg=dict(type='BN'),
+                 drop_path_rate=0.0,
+                 **kwargs):
+        self.block = block
+        self.expansion = get_expansion(block, expansion)
+
+        if isinstance(drop_path_rate, float):
+            drop_path_rate = [drop_path_rate] * num_blocks
+
+        assert len(drop_path_rate
+                   ) == num_blocks, 'Please check the length of drop_path_rate'
+
+        downsample = None
+        if stride != 1 or in_channels != out_channels:
+            downsample = []
+            conv_stride = stride
+            if avg_down and stride != 1:
+                conv_stride = 1
+                downsample.append(
+                    nn.AvgPool2d(
+                        kernel_size=stride,
+                        stride=stride,
+                        ceil_mode=True,
+                        count_include_pad=False))
+            downsample.extend([
+                build_conv_layer(
+                    conv_cfg,
+                    in_channels,
+                    out_channels,
+                    kernel_size=1,
+                    stride=conv_stride,
+                    bias=False),
+                build_norm_layer(norm_cfg, out_channels)[1]
+            ])
+            downsample = nn.Sequential(*downsample)
+
+        layers = []
+        layers.append(
+            block(
+                in_channels=in_channels,
+                out_channels=out_channels,
+                expansion=self.expansion,
+                stride=stride,
+                downsample=downsample,
+                conv_cfg=conv_cfg,
+                norm_cfg=norm_cfg,
+                drop_path_rate=drop_path_rate[0],
+                **kwargs))
+        in_channels = out_channels
+        for i in range(1, num_blocks):
+            layers.append(
+                block(
+                    in_channels=in_channels,
+                    out_channels=out_channels,
+                    expansion=self.expansion,
+                    stride=1,
+                    conv_cfg=conv_cfg,
+                    norm_cfg=norm_cfg,
+                    drop_path_rate=drop_path_rate[i],
+                    **kwargs))
+        super(ResLayer, self).__init__(*layers)
 
 class SwinBlock(BaseModule):
     """Swin Transformer block.
@@ -353,6 +754,8 @@ class SwinTransformer(BaseBackbone):
         )
         _patch_cfg.update(patch_cfg)
         self.patch_embed = PatchEmbed(**_patch_cfg)
+        #self.patch_embed_current = PatchEmbed(**_patch_cfg)
+        #self.patch_embed_diff = PatchEmbed(**_patch_cfg)
         self.patch_resolution = self.patch_embed.init_out_size
 
         if self.use_abs_pos_embed:
@@ -426,6 +829,58 @@ class SwinTransformer(BaseBackbone):
         self.rnn_layers_current.append(self.rnn_layers_3)
         self.rnn_layers_current.append(self.rnn_layers_4)
 
+        # self.current_stem = nn.Sequential(
+        #     nn.Conv2d(3, 64, kernel_size=7, stride=2, padding=3, bias=False),
+        #     nn.BatchNorm2d(64),
+        #     nn.ReLU(inplace=True),
+        #     nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
+        # )
+        #
+        # self.diff_stem = nn.Sequential(
+        #     nn.Conv2d(3, 64, kernel_size=7, stride=2, padding=3, bias=False),
+        #     nn.BatchNorm2d(64),
+        #     nn.ReLU(inplace=True),
+        #     nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
+        # )
+        #
+        # self.current_layer1 = self.make_res_layer(
+        #     block = BasicBlock,
+        #     num_blocks=2,
+        #     in_channels=64,
+        #     out_channels=96,
+        #     expansion=1,
+        #     stride=1,
+        #     dilation=1,
+        #     style='pytorch',
+        #     avg_down=False,
+        #     with_cp=False,
+        #     conv_cfg=None,
+        #     norm_cfg=dict(type='BN', requires_grad=True),
+        #     drop_path_rate=[0,0]
+        # )
+        #
+        # self.diff_layer1 = self.make_res_layer(
+        #     block=BasicBlock,
+        #     num_blocks=2,
+        #     in_channels=64,
+        #     out_channels=96,
+        #     expansion=1,
+        #     stride=1,
+        #     dilation=1,
+        #     style='pytorch',
+        #     avg_down=False,
+        #     with_cp=False,
+        #     conv_cfg=None,
+        #     norm_cfg=dict(type='BN', requires_grad=True),
+        #     drop_path_rate=[0, 0]
+        # )
+        #
+        # #self.fusion = nn.Conv2d(64, 96, kernel_size=1)
+        # self.fusion_norm = build_norm_layer(dict(type='LN'), 96)[1]
+
+    # def make_res_layer(self, **kwargs):
+    #     return ResLayer(**kwargs)
+
     def init_weights(self):
         super(SwinTransformer, self).init_weights()
 
@@ -441,6 +896,22 @@ class SwinTransformer(BaseBackbone):
         B, C, H, W = x.shape
         T = 256
         B = B//256
+        #current = x[:,:C//2,:,:]
+        #diff = x[:,C//2:,:,:]
+        # current = self.current_stem(current) # 64
+        # current = self.current_layer1(current)
+        # diff = self.diff_stem(diff)
+        # diff = self.diff_layer1(diff)
+        #
+        # hw_shape = (current.shape[2], current.shape[3])
+        # x = current + diff
+        # #x = self.fusion(x) # 64 -> 96
+        # x = x.flatten(2).transpose(1,2)
+        # x = self.fusion_norm(x)
+
+        #current, hw_shape = self.patch_embed_current(current)
+        #diff, hw_shape = self.patch_embed_diff(diff)
+        #x = current + diff
         x, hw_shape = self.patch_embed(x)
         if self.use_abs_pos_embed:
             x = x + resize_pos_embed(
